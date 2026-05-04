@@ -1,6 +1,6 @@
 import Foundation
 
-/// The single error type thrown by every failable SwiftVLC API.
+/// The single error type thrown by every throwing SwiftVLC API.
 ///
 /// All throwing functions in SwiftVLC use Swift's typed throws form
 /// `throws(VLCError)`, so the cases below are exhaustive. A general
@@ -9,7 +9,7 @@ import Foundation
 ///
 /// Every case carries enough context (URL, operation name, reason string)
 /// to log meaningfully without consulting libVLC's own diagnostics.
-public enum VLCError: Error, Sendable, LocalizedError, CustomStringConvertible {
+public enum VLCError: Error, Sendable, Equatable, Hashable, LocalizedError, CustomStringConvertible {
   /// libVLC could not allocate an instance, player, or discoverer.
   ///
   /// Typically indicates that the `libvlc.xcframework` is not linked
@@ -34,6 +34,11 @@ public enum VLCError: Error, Sendable, LocalizedError, CustomStringConvertible {
   /// current state (e.g. setting an A-B loop before any media is
   /// loaded). The associated string names the constraint that failed.
   case invalidState(String)
+  /// A public API received an argument outside its documented range.
+  ///
+  /// The associated string names the invalid parameter and the accepted
+  /// range or constraint.
+  case invalidInput(String)
   /// A libVLC call returned a non-zero error code. The associated
   /// string names the operation that was attempted.
   case operationFailed(_ operation: String)
@@ -54,6 +59,8 @@ public enum VLCError: Error, Sendable, LocalizedError, CustomStringConvertible {
       "Track not found: \(id)"
     case .invalidState(let message):
       "Invalid state: \(message)"
+    case .invalidInput(let message):
+      "Invalid input: \(message)"
     case .operationFailed(let operation):
       "\(operation) failed"
     }
@@ -61,5 +68,54 @@ public enum VLCError: Error, Sendable, LocalizedError, CustomStringConvertible {
 
   public var errorDescription: String? {
     description
+  }
+}
+
+// MARK: - Per-case accessors
+
+extension VLCError {
+  /// `Void` if this error is `.instanceCreationFailed`, otherwise `nil`.
+  public var instanceCreationFailed: Void? {
+    if case .instanceCreationFailed = self { () } else { nil }
+  }
+
+  /// Source string if this error is `.mediaCreationFailed`, otherwise `nil`.
+  public var mediaCreationFailed: String? {
+    if case .mediaCreationFailed(let value) = self { value } else { nil }
+  }
+
+  /// Reason string if this error is `.playbackFailed`, otherwise `nil`.
+  public var playbackFailed: String? {
+    if case .playbackFailed(let value) = self { value } else { nil }
+  }
+
+  /// Reason string if this error is `.parseFailed`, otherwise `nil`.
+  public var parseFailed: String? {
+    if case .parseFailed(let value) = self { value } else { nil }
+  }
+
+  /// `Void` if this error is `.parseTimeout`, otherwise `nil`.
+  public var parseTimeout: Void? {
+    if case .parseTimeout = self { () } else { nil }
+  }
+
+  /// Track id string if this error is `.trackNotFound`, otherwise `nil`.
+  public var trackNotFound: String? {
+    if case .trackNotFound(let value) = self { value } else { nil }
+  }
+
+  /// Constraint message if this error is `.invalidState`, otherwise `nil`.
+  public var invalidState: String? {
+    if case .invalidState(let value) = self { value } else { nil }
+  }
+
+  /// Validation message if this error is `.invalidInput`, otherwise `nil`.
+  public var invalidInput: String? {
+    if case .invalidInput(let value) = self { value } else { nil }
+  }
+
+  /// Operation name if this error is `.operationFailed`, otherwise `nil`.
+  public var operationFailed: String? {
+    if case .operationFailed(let value) = self { value } else { nil }
   }
 }

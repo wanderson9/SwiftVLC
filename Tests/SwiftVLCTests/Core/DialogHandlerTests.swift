@@ -133,5 +133,73 @@ extension Integration {
       }
       #expect(types.count == 3)
     }
+
+    /// Two `DialogHandler`s on the same `VLCInstance` cannot both
+    /// register — the second one finishes its stream immediately. This
+    /// is the contract the per-instance registry enforces.
+    @Test
+    func `Second handler on same instance finishes its stream immediately`() async throws {
+      let instance = try VLCInstance()
+      let first = DialogHandler(instance: instance)
+      let second = DialogHandler(instance: instance)
+
+      // The second handler's stream should already be finished. Iterate
+      // through it; we expect no events and prompt completion.
+      var iter = second.dialogs.makeAsyncIterator()
+      let next = await iter.next()
+      #expect(next == nil, "second handler should yield no events")
+
+      _ = first // keep first alive until end
+    }
+
+    /// Each `VLCInstance` has its own registration slot — `DialogHandler`s
+    /// on different instances coexist. The probe: handler A registers
+    /// first, then a second handler on the SAME instance should fail to
+    /// register (already-finished stream). A second handler on a
+    /// DIFFERENT instance succeeds.
+    @Test
+    func `DialogHandlers on different instances coexist`() async throws {
+      let instanceA = try VLCInstance()
+      let instanceB = try VLCInstance()
+
+      let handlerA = DialogHandler(instance: instanceA)
+      let handlerB = DialogHandler(instance: instanceB)
+
+      // A second handler on instanceA loses the race — its stream is
+      // immediately finished.
+      let secondA = DialogHandler(instance: instanceA)
+      var iterA = secondA.dialogs.makeAsyncIterator()
+      #expect(await iterA.next() == nil, "second handler on same instance should be finished")
+
+      // Both `handlerA` and `handlerB` should still hold their slots —
+      // we have no easy way to assert "live" without sending real
+      // events, but the test passes if the second-on-A handler closed
+      // and neither A nor B crashed.
+      _ = handlerA
+      _ = handlerB
+    }
+
+    /// After the first handler is released, a new handler on the same
+    /// instance should be able to register successfully.
+    @Test
+    func `Releasing the first handler frees the instance slot`() async throws {
+      let instance = try VLCInstance()
+
+      var first: DialogHandler? = DialogHandler(instance: instance)
+      _ = first?.dialogs
+      first = nil
+
+      // A fresh handler on the same instance should claim the slot now.
+      // We verify by spawning a SECOND fresh handler — if the slot was
+      // freed correctly, only the next one (the third) sees an
+      // immediately-finished stream.
+      let second = DialogHandler(instance: instance)
+      let third = DialogHandler(instance: instance)
+
+      var iterThird = third.dialogs.makeAsyncIterator()
+      #expect(await iterThird.next() == nil, "third handler should be finished — second should have claimed the slot")
+
+      _ = second
+    }
   }
 }

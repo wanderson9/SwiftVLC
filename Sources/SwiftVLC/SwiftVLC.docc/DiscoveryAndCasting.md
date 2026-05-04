@@ -42,6 +42,7 @@ as soon as a renderer appears or disappears:
 ```swift
 let services = RendererDiscoverer.availableServices()
 guard let service = services.first else { return }
+var player = Player()
 
 let discoverer = try RendererDiscoverer(name: service.name)
 try discoverer.start()
@@ -50,14 +51,27 @@ for await event in discoverer.events {
     switch event {
     case .itemAdded(let renderer):
         print("Found", renderer.name, renderer.type)
-        try? player.setRenderer(renderer)
+        let castPlayer = Player()
+        do {
+            try castPlayer.setRenderer(renderer)
+            try castPlayer.play(url: mediaURL)
+            player.stop()
+            player = castPlayer
+        } catch {
+            print("Cast failed:", error)
+        }
     case .itemDeleted(let renderer):
         print("Lost", renderer.name)
     }
 }
 ```
 
-Pass `nil` to ``Player/setRenderer(_:)`` to revert to local playback.
+libVLC applies renderer selection before a native media player's first
+play. SwiftVLC preserves that rule at the public API boundary: set the
+renderer before starting playback on a ``Player``. To retarget after
+local playback has already started, create a fresh ``Player`` as shown
+above. Pass `nil` to ``Player/setRenderer(_:)`` before playback starts
+to revert to local playback.
 
 ## Inspecting a renderer
 

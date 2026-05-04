@@ -5,9 +5,9 @@ Tune volume, output routing, channel mixing, and equalization.
 ## Volume, mute, delay
 
 ```swift
-player.volume = 0.8            // 0.0 silent, 1.0 is 100%, up to 1.25
+try player.setAudioVolume(0.8)             // 0.0 silent, 1.0 is 100%, up to 1.25
 player.isMuted = false
-player.audioDelay = .milliseconds(30)    // positive = audio plays later
+try player.setAudioDelay(.milliseconds(30)) // positive = audio plays later
 ```
 
 Volume is normalized, so `0.0 ... 1.0` covers the useful range; values
@@ -44,16 +44,27 @@ support. Build one, tune it, and attach it to a player:
 
 ```swift
 let eq = Equalizer()
-eq.preamp = 4.0                              // dB; clamped to -20...+20
+eq.preampGain = 4.0                          // dB; clamped to -20...+20
 try eq.setAmplification(5.0, forBand: 0)     // bass lift
 player.equalizer = eq
+```
+
+For new code, prefer the typed accessors that wrap raw `Float` gains
+in ``EqualizerGain`` — each value is clamped to libVLC's
+`-20.0 ... +20.0` dB range at the type level:
+
+```swift
+eq.preampGain = .flat
+try eq.setBandGains([+3.0, +2.0, .flat, -1.0, -2.0, -2.0, -1.0, .flat, +1.0, +2.0])
+try eq.setGain(+6.0, forBand: 3)
 ```
 
 Use a built-in preset by index:
 
 ```swift
-let rock = Equalizer(preset: Equalizer.presetNames.firstIndex(of: "Rock") ?? 0)
-player.equalizer = rock
+if let rock = Equalizer(preset: Equalizer.presetNames.firstIndex(of: "Rock") ?? 0) {
+    player.equalizer = rock
+}
 ```
 
 Pass `nil` to disable: `player.equalizer = nil`.
@@ -103,6 +114,7 @@ See ``PlayerRole`` for the full set.
 ### Equalization
 - ``Equalizer``
 - ``Player/equalizer``
+- ``EqualizerGain``
 
 ### Channel layout and role
 - ``Player/stereoMode``

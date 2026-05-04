@@ -2,7 +2,7 @@ import SwiftUI
 import SwiftVLC
 
 struct MacDeinterlacingCase: View {
-  @State private var player = Player()
+  @State private var player = Player(instance: Self.playerInstance)
   @State private var state: Deinterlace = .auto
   @State private var mode: Mode = .yadif
 
@@ -18,10 +18,13 @@ struct MacDeinterlacingCase: View {
         MacSection(title: "Filter") {
           Picker("State", selection: $state) {
             ForEach(Deinterlace.allCases) { state in
-              Text(state.label).tag(state)
+              Text(state.label)
+                .tag(state)
+                .accessibilityIdentifier(state.accessibilityIdentifier)
             }
           }
           .pickerStyle(.segmented)
+          .accessibilityIdentifier(AccessibilityID.MacDeinterlace.statePicker)
           .onChange(of: state) { applyDeinterlace() }
 
           Picker("Mode", selection: $mode) {
@@ -29,23 +32,33 @@ struct MacDeinterlacingCase: View {
               Text(mode.rawValue).tag(mode)
             }
           }
+          .accessibilityIdentifier(AccessibilityID.MacDeinterlace.modePicker)
           .onChange(of: mode) { applyDeinterlace() }
         }
       }
     } sidebar: {
       MacSection(title: "Current") {
         MacMetricGrid {
-          MacMetricRow(title: "State", value: state.label)
-          MacMetricRow(title: "Mode", value: mode.rawValue)
+          MacMetricRow(
+            title: "State",
+            value: state.label,
+            valueIdentifier: AccessibilityID.MacDeinterlace.stateValue
+          )
+          MacMetricRow(
+            title: "Mode",
+            value: mode.rawValue,
+            valueIdentifier: AccessibilityID.MacDeinterlace.modeValue
+          )
         }
       }
       MacLibrarySurface(symbols: ["player.setDeinterlace(state:mode:)"])
     }
-    .task { task() }
+    .task { await task() }
     .onDisappear { player.stop() }
   }
 
-  private func task() {
+  @MainActor
+  private func task() async {
     try? player.play(url: MacTestMedia.demo)
     applyDeinterlace()
   }
@@ -53,6 +66,12 @@ struct MacDeinterlacingCase: View {
   private func applyDeinterlace() {
     try? player.setDeinterlace(state: state.rawValue, mode: mode.rawValue)
   }
+
+  private static let playerInstance = try! VLCInstance(
+    arguments: VLCInstance.defaultArguments + [
+      "--codec=avcodec"
+    ]
+  )
 }
 
 private enum Deinterlace: Int, CaseIterable, Identifiable {
@@ -69,6 +88,14 @@ private enum Deinterlace: Int, CaseIterable, Identifiable {
     case .off: "Off"
     case .on: "On"
     case .auto: "Auto"
+    }
+  }
+
+  var accessibilityIdentifier: String {
+    switch self {
+    case .off: AccessibilityID.MacDeinterlace.stateOffSegment
+    case .on: AccessibilityID.MacDeinterlace.stateOnSegment
+    case .auto: AccessibilityID.MacDeinterlace.stateAutoSegment
     }
   }
 }

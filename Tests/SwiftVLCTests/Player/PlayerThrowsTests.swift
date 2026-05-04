@@ -13,13 +13,14 @@ extension Integration {
     // MARK: - setRenderer
 
     /// `setRenderer` is defended at the Swift layer against being called
-    /// while the player is active — the operation would corrupt libVLC's
-    /// internal state. The guard throws before libVLC is even reached.
+    /// after playback has started. libVLC only applies renderer selection
+    /// before the native media player's first play, so SwiftVLC rejects
+    /// unsupported retargeting before libVLC is reached.
     @Test
-    func `setRenderer while buffering throws invalidState-shaped error`() throws {
+    func `setRenderer while buffering throws before reaching libVLC`() throws {
       let player = Player(instance: TestInstance.shared)
       player._setStateForTesting(state: .buffering)
-      #expect(throws: VLCError.self) {
+      #expect(throws: VLCError.invalidState("setRenderer requires idle, stopped, or error state; current state is buffering")) {
         try player.setRenderer(nil)
       }
     }
@@ -28,7 +29,7 @@ extension Integration {
     func `setRenderer while playing throws`() throws {
       let player = Player(instance: TestInstance.shared)
       player._setStateForTesting(state: .playing)
-      #expect(throws: VLCError.self) {
+      #expect(throws: VLCError.invalidState("setRenderer requires idle, stopped, or error state; current state is playing")) {
         try player.setRenderer(nil)
       }
     }
@@ -37,7 +38,7 @@ extension Integration {
     func `setRenderer while paused throws`() throws {
       let player = Player(instance: TestInstance.shared)
       player._setStateForTesting(state: .paused)
-      #expect(throws: VLCError.self) {
+      #expect(throws: VLCError.invalidState("setRenderer requires idle, stopped, or error state; current state is paused")) {
         try player.setRenderer(nil)
       }
     }
@@ -54,6 +55,17 @@ extension Integration {
       let player = Player(instance: TestInstance.shared)
       player._setStateForTesting(state: .stopped)
       try player.setRenderer(nil)
+    }
+
+    @Test
+    func `setRenderer while stopped after playback started throws`() throws {
+      let player = Player(instance: TestInstance.shared)
+      player._setStateForTesting(state: .stopped)
+      player.nativePlayerHasStartedPlayback = true
+
+      #expect(throws: VLCError.invalidState("setRenderer must be called before the first play() on this Player")) {
+        try player.setRenderer(nil)
+      }
     }
 
     // MARK: - setDeinterlace
@@ -80,6 +92,91 @@ extension Integration {
       try player.setDeinterlace(state: 1, mode: "blend")
     }
 
+    @Test
+    func `setDeinterlace rejects unrepresentable state instead of trapping`() throws {
+      let player = Player(instance: TestInstance.shared)
+      #expect(throws: VLCError.self) {
+        try player.setDeinterlace(state: Int.max)
+      }
+    }
+
+    @Test
+    func `setDeinterlace rejects undefined state values`() throws {
+      let player = Player(instance: TestInstance.shared)
+      #expect(throws: VLCError.invalidInput("state must be -1 (auto), 0 (off), or 1 (on)")) {
+        try player.setDeinterlace(state: 2)
+      }
+      #expect(throws: VLCError.invalidInput("state must be -1 (auto), 0 (off), or 1 (on)")) {
+        try player.setDeinterlace(state: -2)
+      }
+    }
+
+    #if os(macOS)
+    @Test
+    func `setDeinterlace rejects active macOS hardware decoded playback`() throws {
+      let player = try Player(instance: VLCInstance(arguments: VLCInstance.defaultArguments))
+      player._setStateForTesting(state: .playing)
+
+      #expect(throws: VLCError.self) {
+        try player.setDeinterlace(state: 1, mode: "yadif")
+      }
+    }
+
+    @Test
+    func `setDeinterlace allows active macOS software decoded playback`() throws {
+      let instance = try VLCInstance(
+        arguments: VLCInstance.defaultArguments + [
+          "--codec=avcodec"
+        ]
+      )
+      let player = Player(instance: instance)
+      player._setStateForTesting(state: .playing)
+
+      try player.setDeinterlace(state: 1, mode: "blend")
+    }
+    #endif
+
+    // MARK: - snapshot
+
+    @Test
+    func `takeSnapshot rejects invalid dimensions before calling libVLC`() throws {
+      let player = Player(instance: TestInstance.shared)
+      #expect(throws: VLCError.self) {
+        try player.takeSnapshot(to: "/tmp/swiftvlc-invalid-snapshot.png", width: -1)
+      }
+    }
+
+    // MARK: - teletext
+
+    @Test
+    func `setTeletextPage rejects values outside libVLC page domain`() throws {
+      let player = Player(instance: TestInstance.shared)
+      #expect(throws: VLCError.invalidInput("teletext page must be 0 or in 1...999")) {
+        try player.setTeletextPage(-1)
+      }
+      #expect(throws: VLCError.invalidInput("teletext page must be 0 or in 1...999")) {
+        try player.setTeletextPage(1000)
+      }
+    }
+
+    @Test
+    func `setTeletextPage accepts disable and valid pages`() throws {
+      let player = Player(instance: TestInstance.shared)
+      try player.setTeletextPage(0)
+      try player.setTeletextPage(100)
+      try player.setTeletextPage(999)
+    }
+
+    @Test
+    func `sendTeletextKey accepts typed keys`() {
+      let player = Player(instance: TestInstance.shared)
+      player.sendTeletextKey(.red)
+      player.sendTeletextKey(.green)
+      player.sendTeletextKey(.yellow)
+      player.sendTeletextKey(.blue)
+      player.sendTeletextKey(.index)
+    }
+
     // MARK: - setRate
 
     @Test
@@ -90,15 +187,13 @@ extension Integration {
       try player.setRate(2.0)
     }
 
-    /// Documents an observed libVLC quirk: `set_rate(0)` returns 0
-    /// (success) even though 0 is not a meaningful playback rate — it's
-    /// equivalent to a pause. This test pins the behavior so a future
-    /// libVLC that starts rejecting 0 is caught as a surprise rather
-    /// than masked.
+    /// SwiftVLC no longer exposes libVLC's raw `set_rate(0)` quirk. The
+    /// typed rate clamps invalid low values before they reach libVLC.
     @Test
-    func `setRate zero is accepted by libVLC (documents the quirk)`() throws {
+    func `setRate zero is clamped by typed PlaybackRate`() throws {
       let player = Player(instance: TestInstance.shared)
-      try player.setRate(0)
+      try player.setRate(PlaybackRate(0))
+      #expect(player.playbackRate == .slowest)
     }
 
     // MARK: - setAudioOutput

@@ -218,7 +218,7 @@ extension Integration {
         let player = Player(instance: TestInstance.makeAudioOnly())
         let eq = Equalizer()
         player.equalizer = eq
-        eq.preamp = 5
+        eq.preampGain = 5.0
         weakPlayer = player
         weakEQ = eq
       }
@@ -296,6 +296,22 @@ extension Integration {
         _ = disc.events
       }
       #expect(weakDisc == nil, "RendererDiscoverer leaked")
+    }
+
+    @Test
+    func `RendererDiscoverer accepts a custom instance during async cleanup`() async throws {
+      let instance = try VLCInstance()
+      guard let service = RendererDiscoverer.availableServices(instance: instance).first else {
+        return
+      }
+
+      do {
+        let disc = try RendererDiscoverer(name: service.name, instance: instance)
+        _ = disc.events
+        try? disc.start()
+      }
+
+      try? await Task.sleep(for: .milliseconds(100))
     }
 
     // MARK: - VLCInstance
@@ -391,7 +407,7 @@ extension Integration {
           let eq = Equalizer()
           probes.add(eq)
           player.equalizer = eq
-          eq.preamp = Float.random(in: -10...10)
+          eq.preampGain = EqualizerGain(Float.random(in: -10...10))
           player.equalizer = nil
         }
       }

@@ -6,7 +6,8 @@ import Foundation
 /// dash-prefixed string here is the launch-arg name and the un-prefixed
 /// version is the `UserDefaults` key.
 enum LaunchArguments {
-  /// `YES` when running under XCUITest. Gates every test-mode behavior.
+  /// `YES` when running under XCUITest. Gates showcase behavior that should
+  /// only run in UI tests.
   static let uiTestMode = "-UITestMode"
 
   /// Absolute path to a media file. When set, showcase media helpers resolve
@@ -16,6 +17,11 @@ enum LaunchArguments {
   /// Absolute path where the showcase mirrors `VLCInstance.shared.logStream`
   /// as JSONL records (one entry per line).
   static let logPath = "-UITestLogPath"
+
+  /// Pipe-separated absolute paths used by Music Player UI tests to
+  /// exercise distinct local media swaps without depending on network
+  /// streams.
+  static let musicFixtureURLs = "-UITestMusicFixtureURLs"
 
   /// Name of a showcase to deep-link to on launch (e.g. `"SimplePlayback"`).
   /// When unset, the showcase opens its normal navigation tree.
@@ -31,6 +37,13 @@ enum LaunchArguments {
 
   static var logPathValue: String? {
     UserDefaults.standard.string(forKey: key(logPath))
+  }
+
+  static var musicFixtureURLValues: [URL] {
+    UserDefaults.standard.string(forKey: key(musicFixtureURLs))?
+      .split(separator: "|")
+      .map { URL(fileURLWithPath: String($0)) }
+      ?? []
   }
 
   static var routeValue: String? {

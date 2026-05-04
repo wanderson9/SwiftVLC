@@ -102,13 +102,15 @@ public final class Media: Sendable {
   ///   - instance: The libVLC instance that performs the parse.
   /// - Returns: The parsed ``Metadata``. Call ``tracks()`` afterwards
   ///   to obtain the discovered tracks.
-  /// - Throws: ``VLCError/parseTimeout`` if `timeout` expires, or
+  /// - Throws: ``VLCError/invalidInput(_:)`` if `timeout` is negative or too large,
+  ///   ``VLCError/parseTimeout-enum.case`` if `timeout` expires, or
   ///   ``VLCError/parseFailed(reason:)`` for any other failure.
   public func parse(
     timeout: Duration = .seconds(10),
     instance: VLCInstance = .shared
   )
     async throws(VLCError) -> Metadata {
+    let timeoutMs = try timeout.checkedNonnegativeInt32Milliseconds(parameter: "timeout")
     let media = pointer
     let em = libvlc_media_event_manager(media)!
     let instancePtr = instance.pointer
@@ -163,7 +165,6 @@ public final class Media: Sendable {
           return
         }
 
-        let timeoutMs = Int32(timeout.milliseconds)
         let flags = libvlc_media_parse_flag_t(
           rawValue: libvlc_media_parse_local.rawValue | libvlc_media_parse_network.rawValue
         )
@@ -246,20 +247,17 @@ public final class Media: Sendable {
   ///     `UInt32`. libVLC clamps the value to its user-slave ceiling
   ///     internally, so values above ~4 are normalized. Defaults to `4`
   ///     which matches libVLC's priority for user-added files.
-  /// - Precondition: `priority` is in `0...UInt32.max`.
-  /// - Throws: `VLCError.operationFailed` if the slave cannot be attached.
+  /// - Throws: ``VLCError/invalidInput(_:)`` if `priority` is negative or too large,
+  ///   or ``VLCError/operationFailed(_:)`` if the slave cannot be attached.
   public func addSlave(
     from url: URL,
     type: MediaSlaveType,
     priority: Int = 4
   )
     throws(VLCError) {
-    precondition(
-      priority >= 0 && priority <= Int(UInt32.max),
-      "Slave priority \(priority) is out of range (0 ... \(UInt32.max))"
-    )
+    let priority = try checkedUInt32(priority, parameter: "priority")
     let uri = url.absoluteString
-    guard libvlc_media_slaves_add(pointer, type.cValue, UInt32(priority), uri) == 0 else {
+    guard libvlc_media_slaves_add(pointer, type.cValue, priority, uri) == 0 else {
       throw .operationFailed("Add slave \(type) from \(uri)")
     }
   }
@@ -299,9 +297,11 @@ public final class Media: Sendable {
   ///
   /// The file descriptor must be open for reading. libVLC will **not** close it.
   /// - Parameter fd: An open file descriptor.
-  /// - Throws: `VLCError.mediaCreationFailed` if creation fails.
+  /// - Throws: ``VLCError/invalidInput(_:)`` if `fd` cannot be passed to libVLC,
+  ///   or ``VLCError/mediaCreationFailed(source:)`` if creation fails.
   public init(fileDescriptor fd: Int) throws(VLCError) {
-    guard let media = libvlc_media_new_fd(Int32(fd)) else {
+    let fd = try checkedInt32(fd, parameter: "fileDescriptor")
+    guard let media = libvlc_media_new_fd(fd) else {
       throw .mediaCreationFailed(source: "fd:\(fd)")
     }
     pointer = media
@@ -312,8 +312,11 @@ public final class Media: Sendable {
   /// Options use libVLC's command-line syntax, with a leading `:` for
   /// input options. For example, `:network-caching=1000` sets a
   /// one-second network buffer; `:start-time=30` skips the first 30
-  /// seconds. Call this repeatedly to add multiple options. Options
-  /// have no effect once the media has begun playing.
+  /// seconds. HTTP options such as `:http-user-agent=App/1.0` and
+  /// `:http-referrer=https://example.com` are passed through when
+  /// supported by the bundled libVLC build. This does not add arbitrary
+  /// HTTP header injection. Call this repeatedly to add multiple
+  /// options. Options have no effect once the media has begun playing.
   public func addOption(_ option: String) {
     libvlc_media_add_option(pointer, option)
   }
@@ -356,6 +359,15 @@ private final class ParseOperationRef: Sendable {
 
 private final class ParseOperation: Sendable {
   private struct State: @unchecked Sendable {
+    // Pointers live inside `State` so the Mutex's release-acquire
+    // pairing establishes a happens-before relation between the init
+    // (writer thread) and the libVLC event-thread callback (reader).
+    // ThreadSanitizer cannot see libVLC's internal synchronization; the
+    // explicit lock here makes the ordering visible without changing
+    // observable behavior — these pointers are write-once at init.
+    let media: OpaquePointer
+    let eventManager: OpaquePointer
+    let instance: OpaquePointer
     var continuation: CheckedContinuation<Result<Metadata, VLCError>, Never>?
     var callbackBox: UnsafeMutableRawPointer?
     var eventAttached = false
@@ -368,6 +380,7 @@ private final class ParseOperation: Sendable {
   private struct Cleanup: @unchecked Sendable {
     let callbackBox: UnsafeMutableRawPointer?
     let shouldDetachEvent: Bool
+    let eventManager: OpaquePointer
   }
 
   private struct Resume: @unchecked Sendable {
@@ -375,10 +388,14 @@ private final class ParseOperation: Sendable {
     let result: Result<Metadata, VLCError>
   }
 
-  nonisolated(unsafe) let media: OpaquePointer
-  private nonisolated(unsafe) let eventManager: OpaquePointer
-  private nonisolated(unsafe) let instance: OpaquePointer
   private let state: Mutex<State>
+
+  /// The media pointer this operation parses. Read through the lock so
+  /// callers (including the libVLC callback thread) get a TSan-visible
+  /// happens-before from init.
+  var media: OpaquePointer {
+    state.withLock { $0.media }
+  }
 
   init(
     continuation: CheckedContinuation<Result<Metadata, VLCError>, Never>,
@@ -386,14 +403,17 @@ private final class ParseOperation: Sendable {
     eventManager: OpaquePointer,
     instance: OpaquePointer
   ) {
-    self.media = media
-    self.eventManager = eventManager
-    self.instance = instance
     libvlc_media_retain(media)
-    state = Mutex(State(continuation: continuation))
+    state = Mutex(State(
+      media: media,
+      eventManager: eventManager,
+      instance: instance,
+      continuation: continuation
+    ))
   }
 
   deinit {
+    let media = state.withLock { $0.media }
     libvlc_media_release(media)
   }
 
@@ -415,25 +435,23 @@ private final class ParseOperation: Sendable {
   }
 
   func cancel() {
-    let resumeOrStop = state.withLock { state -> (Resume?, Bool) in
-      guard !state.isUserFinished else { return (nil, false) }
+    let (resume, parseStopArgs) = state.withLock { state -> (Resume?, (instance: OpaquePointer, media: OpaquePointer)?) in
+      guard !state.isUserFinished else { return (nil, nil) }
       state.isCancellationRequested = true
       guard state.requestStarted else {
-        return (
-          finishUserLocked(
-            &state,
-            with: .failure(.parseFailed(reason: "cancelled"))
-          ),
-          false
+        let resume = finishUserLocked(
+          &state,
+          with: .failure(.parseFailed(reason: "cancelled"))
         )
+        return (resume, nil)
       }
-      return (nil, true)
+      return (nil, (instance: state.instance, media: state.media))
     }
 
-    if resumeOrStop.1 {
-      libvlc_media_parse_stop(instance, media)
+    if let parseStopArgs {
+      libvlc_media_parse_stop(parseStopArgs.instance, parseStopArgs.media)
     }
-    if let resume = resumeOrStop.0 {
+    if let resume {
       resume.continuation.resume(returning: resume.result)
     }
   }
@@ -485,7 +503,8 @@ private final class ParseOperation: Sendable {
 
     let cleanup = Cleanup(
       callbackBox: state.callbackBox,
-      shouldDetachEvent: state.eventAttached
+      shouldDetachEvent: state.eventAttached,
+      eventManager: state.eventManager
     )
 
     state.callbackBox = nil
@@ -498,7 +517,7 @@ private final class ParseOperation: Sendable {
     guard let cleanup else { return }
     if cleanup.shouldDetachEvent, let box = cleanup.callbackBox {
       libvlc_event_detach(
-        eventManager,
+        cleanup.eventManager,
         Int32(libvlc_MediaParsedChanged.rawValue),
         parseCallback,
         box

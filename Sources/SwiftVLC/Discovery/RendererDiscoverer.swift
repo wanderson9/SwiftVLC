@@ -10,6 +10,7 @@ import Dispatch
 /// ```swift
 /// let services = RendererDiscoverer.availableServices()
 /// guard let service = services.first else { return }
+/// var player = Player()
 ///
 /// let discoverer = try RendererDiscoverer(name: service.name)
 /// try discoverer.start()
@@ -17,7 +18,15 @@ import Dispatch
 /// for await event in discoverer.events {
 ///     switch event {
 ///     case let .itemAdded(renderer):
-///         try? player.setRenderer(renderer)
+///         let castPlayer = Player()
+///         do {
+///             try castPlayer.setRenderer(renderer)
+///             try castPlayer.play(url: mediaURL)
+///             player.stop()
+///             player = castPlayer
+///         } catch {
+///             print("Cast failed:", error)
+///         }
 ///     case let .itemDeleted(renderer):
 ///         print("Lost: \(renderer.name)")
 ///     }
@@ -26,11 +35,14 @@ import Dispatch
 public final class RendererDiscoverer: Sendable {
   nonisolated(unsafe) let pointer: OpaquePointer // libvlc_renderer_discoverer_t*
   private let instance: VLCInstance
-  private let continuation: AsyncStream<RendererEvent>.Continuation
+  private let broadcaster: Broadcaster<RendererEvent>
   private nonisolated(unsafe) let opaque: UnsafeMutableRawPointer
 
-  /// Stream of renderer discovery events.
-  public let events: AsyncStream<RendererEvent>
+  /// Stream of renderer discovery events. A new independent stream is
+  /// returned per access; subscribers don't compete for events.
+  public var events: AsyncStream<RendererEvent> {
+    broadcaster.subscribe()
+  }
 
   /// Creates a renderer discoverer by service name.
   ///
@@ -48,11 +60,9 @@ public final class RendererDiscoverer: Sendable {
     // matching note in `MediaDiscoverer`.
     self.instance = instance
 
-    let (stream, cont) = AsyncStream<RendererEvent>.makeStream(bufferingPolicy: .bufferingNewest(16))
-    events = stream
-    continuation = cont
-
-    let box = Unmanaged.passRetained(RendererContinuationBox(continuation: cont)).toOpaque()
+    let broadcaster = Broadcaster<RendererEvent>(defaultBufferSize: 16)
+    self.broadcaster = broadcaster
+    let box = Unmanaged.passRetained(broadcaster).toOpaque()
     opaque = box
 
     let em = libvlc_renderer_discoverer_event_manager(p)!
@@ -65,17 +75,19 @@ public final class RendererDiscoverer: Sendable {
     // libvlc_renderer_discoverer_release waits for the discovery
     // thread to stop. Offload off the calling thread. Pointers are
     // trivially transferable via `nonisolated(unsafe)` locals, and the
-    // continuation is Sendable so it can be captured directly.
+    // broadcaster is Sendable so it can be captured directly.
     nonisolated(unsafe) let discoverer = pointer
     nonisolated(unsafe) let box = opaque
-    let continuation = self.continuation
+    let instance = self.instance
+    let broadcaster = self.broadcaster
     DispatchQueue.global(qos: .utility).async {
       let em = libvlc_renderer_discoverer_event_manager(discoverer)!
       libvlc_event_detach(em, Int32(libvlc_RendererDiscovererItemAdded.rawValue), rendererCallback, box)
       libvlc_event_detach(em, Int32(libvlc_RendererDiscovererItemDeleted.rawValue), rendererCallback, box)
-      continuation.finish()
-      Unmanaged<RendererContinuationBox>.fromOpaque(box).release()
+      broadcaster.terminate()
+      Unmanaged<Broadcaster<RendererEvent>>.fromOpaque(box).release()
       libvlc_renderer_discoverer_release(discoverer)
+      _ = instance
     }
   }
 
@@ -99,7 +111,11 @@ public final class RendererDiscoverer: Sendable {
 ///
 /// Holds a reference to the underlying `libvlc_renderer_item_t`.
 /// Pass to ``Player/setRenderer(_:)`` to start casting.
-public final class RendererItem: Sendable {
+///
+/// Identity is the retained libVLC renderer-item pointer. Friendly names
+/// are not unique on a local network, so equality intentionally avoids
+/// collapsing two devices that advertise the same ``type`` and ``name``.
+public final class RendererItem: Sendable, Identifiable, Hashable {
   nonisolated(unsafe) let pointer: OpaquePointer // libvlc_renderer_item_t*
 
   init(retaining ptr: OpaquePointer) {
@@ -121,6 +137,12 @@ public final class RendererItem: Sendable {
     String(cString: libvlc_renderer_item_type(pointer))
   }
 
+  /// Stable identifier for this discovered renderer item while the
+  /// underlying libVLC item is alive.
+  public var id: String {
+    "renderer:\(UInt(bitPattern: UnsafeRawPointer(pointer)))"
+  }
+
   /// URI of the renderer's icon, if available.
   public var iconURI: String? {
     guard let cstr = libvlc_renderer_item_icon_uri(pointer) else { return nil }
@@ -139,6 +161,14 @@ public final class RendererItem: Sendable {
   public var canVideo: Bool {
     libvlc_renderer_item_flags(pointer) & Self.videoFlag != 0
   }
+
+  public static func == (lhs: RendererItem, rhs: RendererItem) -> Bool {
+    lhs.id == rhs.id
+  }
+
+  public func hash(into hasher: inout Hasher) {
+    hasher.combine(id)
+  }
 }
 
 // MARK: - Renderer Events
@@ -149,6 +179,18 @@ public enum RendererEvent: Sendable {
   case itemAdded(RendererItem)
   /// A previously discovered renderer was removed.
   case itemDeleted(RendererItem)
+}
+
+extension RendererEvent {
+  /// `RendererItem` if this event is `.itemAdded`, otherwise `nil`.
+  public var itemAdded: RendererItem? {
+    if case .itemAdded(let value) = self { value } else { nil }
+  }
+
+  /// `RendererItem` if this event is `.itemDeleted`, otherwise `nil`.
+  public var itemDeleted: RendererItem? {
+    if case .itemDeleted(let value) = self { value } else { nil }
+  }
 }
 
 // MARK: - Service Listing
@@ -186,31 +228,24 @@ extension RendererDiscoverer {
 
 // MARK: - Internals
 
-private final class RendererContinuationBox: Sendable {
-  let continuation: AsyncStream<RendererEvent>.Continuation
-  init(continuation: AsyncStream<RendererEvent>.Continuation) {
-    self.continuation = continuation
-  }
-}
-
 private func rendererCallback(
   event: UnsafePointer<libvlc_event_t>?,
   opaque: UnsafeMutableRawPointer?
 ) {
   guard let event, let opaque else { return }
-  let box = Unmanaged<RendererContinuationBox>.fromOpaque(opaque).takeUnretainedValue()
+  let broadcaster = Unmanaged<Broadcaster<RendererEvent>>.fromOpaque(opaque).takeUnretainedValue()
   let type = libvlc_event_e(rawValue: UInt32(event.pointee.type))
 
   switch type {
   case libvlc_RendererDiscovererItemAdded:
     guard let item = event.pointee.u.renderer_discoverer_item_added.item else { return }
     let renderer = RendererItem(retaining: item)
-    box.continuation.yield(.itemAdded(renderer))
+    broadcaster.broadcast(.itemAdded(renderer))
 
   case libvlc_RendererDiscovererItemDeleted:
     guard let item = event.pointee.u.renderer_discoverer_item_deleted.item else { return }
     let renderer = RendererItem(retaining: item)
-    box.continuation.yield(.itemDeleted(renderer))
+    broadcaster.broadcast(.itemDeleted(renderer))
 
   default:
     break

@@ -13,6 +13,7 @@ extension Logic {
         (.parseTimeout, "Media parsing timed out"),
         (.trackNotFound(id: "audio-0"), "Track not found: audio-0"),
         (.invalidState("not playing"), "Invalid state: not playing"),
+        (.invalidInput("width must be non-negative"), "Invalid input: width must be non-negative"),
         (.operationFailed("Snapshot"), "Snapshot failed")
       ] as [(VLCError, String)]
     )
@@ -29,6 +30,7 @@ extension Logic {
         .parseTimeout,
         .trackNotFound(id: "t"),
         .invalidState("s"),
+        .invalidInput("i"),
         .operationFailed("o"),
       ]
     )
@@ -60,6 +62,30 @@ extension Logic {
       let error: VLCError = .parseTimeout
       let sendable: any Sendable = error
       _ = sendable
+    }
+
+    @Test
+    func `Equatable matches like cases by associated value`() {
+      #expect(VLCError.parseTimeout == .parseTimeout)
+      #expect(VLCError.parseTimeout != .instanceCreationFailed)
+      #expect(VLCError.mediaCreationFailed(source: "a.mp4") == .mediaCreationFailed(source: "a.mp4"))
+      #expect(VLCError.mediaCreationFailed(source: "a.mp4") != .mediaCreationFailed(source: "b.mp4"))
+      #expect(VLCError.trackNotFound(id: "0") != .invalidState("0"))
+      #expect(VLCError.invalidInput("width") == .invalidInput("width"))
+      #expect(VLCError.invalidInput("width") != .invalidInput("height"))
+    }
+
+    @Test
+    func `Hashable lets errors be deduplicated in a Set`() {
+      let errors: Set<VLCError> = [
+        .parseTimeout,
+        .parseTimeout,
+        .mediaCreationFailed(source: "a"),
+        .mediaCreationFailed(source: "a"),
+        .mediaCreationFailed(source: "b")
+      ]
+      // .parseTimeout collapses to 1; mediaCreationFailed has 2 distinct sources.
+      #expect(errors.count == 3)
     }
   }
 }

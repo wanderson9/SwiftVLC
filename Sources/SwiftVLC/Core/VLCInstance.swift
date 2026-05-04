@@ -1,5 +1,7 @@
 import CLibVLC
 import Darwin
+import Foundation
+import Synchronization
 
 /// The entry point for all libVLC operations.
 ///
@@ -74,6 +76,16 @@ public final class VLCInstance: Sendable {
     #endif
   }
 
+  var supportsDynamicDeinterlaceChanges: Bool {
+    #if os(macOS)
+    guard !Self.containsOption(named: "no-video", in: arguments) else { return true }
+    let codecs = Self.optionValues(named: "codec", in: arguments)
+    return codecs.contains("avcodec") && !codecs.contains("videotoolbox")
+    #else
+    true
+    #endif
+  }
+
   private static func containsOption(named name: String, in arguments: [String]) -> Bool {
     let longName = "--\(name)"
     let assignmentPrefix = "\(longName)="
@@ -99,10 +111,75 @@ public final class VLCInstance: Sendable {
     return value
   }
 
+  private static func optionValues(named name: String, in arguments: [String]) -> Set<String> {
+    guard let value = lastOptionValue(named: name, in: arguments) else { return [] }
+    return Set(
+      value
+        .split(separator: ",")
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+    )
+  }
+
   /// Multiplexes the single libVLC log callback to any number of Swift
   /// `logStream` consumers. Lazily installs/uninstalls the underlying
   /// libVLC callback as consumers come and go.
   let logBroadcaster: LogBroadcaster
+
+  /// Per-instance dialog-handler claim. Scoping the registration to
+  /// the instance avoids cross-test leakage and ensures a freed
+  /// VLCInstance never leaves stale entries behind.
+  private let dialogRegistration = Mutex(DialogRegistrationState())
+
+  /// `@unchecked` because the box pointer is `UnsafeMutableRawPointer`.
+  /// All access goes through the enclosing `Mutex.withLock`.
+  fileprivate struct DialogRegistrationState: @unchecked Sendable {
+    var token: UUID?
+    var box: UnsafeMutableRawPointer?
+  }
+
+  /// Attempts to claim this instance's single dialog-callback slot and
+  /// install the corresponding native callbacks.
+  ///
+  /// On success, returns the token the caller stores and later passes
+  /// to ``releaseDialogRegistration(token:clearCallbacks:)``. The caller
+  /// is responsible for keeping the box pointer alive until release.
+  ///
+  /// Returns `nil` when another `DialogHandler` already holds the
+  /// slot — the caller must release the box themselves and finish
+  /// their stream.
+  func claimDialogRegistration(
+    box: UnsafeMutableRawPointer,
+    installCallbacks: (OpaquePointer, UnsafeMutableRawPointer) -> Void
+  ) -> UUID? {
+    dialogRegistration.withLock { state -> UUID? in
+      guard state.token == nil else { return nil }
+      let token = UUID()
+      installCallbacks(pointer, box)
+      state.token = token
+      state.box = box
+      return token
+    }
+  }
+
+  /// Clears the native callbacks and releases the dialog-callback slot.
+  /// Returns the box pointer the caller passed to
+  /// `claimDialogRegistration` so it can be balanced with
+  /// `Unmanaged.release()`. Returns `nil` if the token doesn't match the
+  /// current registration.
+  func releaseDialogRegistration(
+    token: UUID,
+    clearCallbacks: (OpaquePointer) -> Void
+  ) -> UnsafeMutableRawPointer? {
+    dialogRegistration.withLock { state -> UnsafeMutableRawPointer? in
+      guard state.token == token else { return nil }
+      let box = state.box
+      clearCallbacks(pointer)
+      state.token = nil
+      state.box = nil
+      return box
+    }
+  }
 
   /// The libVLC version string (e.g. "4.0.0").
   public var version: String {
@@ -124,9 +201,11 @@ public final class VLCInstance: Sendable {
   /// - Parameter arguments: Command-line style arguments for libVLC configuration.
   ///   Common arguments include `"--no-video-title-show"`,
   ///   `"--no-snapshot-preview"`, `"--no-stats"`.
-  /// - Throws: `VLCError.instanceCreationFailed` if libVLC cannot be initialized.
+  /// - Throws: `VLCError.invalidInput` if too many arguments are supplied,
+  ///   or `VLCError.instanceCreationFailed` if libVLC cannot be initialized.
   public init(arguments: [String] = VLCInstance.defaultArguments) throws(VLCError) {
     self.arguments = arguments
+    let argumentCount = try checkedInt32(arguments.count, parameter: "arguments.count")
 
     // Convert Swift strings to C strings for libvlc_new.
     // strdup allocates; freed in defer after libvlc_new copies them.
@@ -136,7 +215,7 @@ public final class VLCInstance: Sendable {
     let instance = cArgs.withUnsafeBufferPointer { buf -> OpaquePointer? in
       // Cast through raw pointer to satisfy libvlc_new's parameter type
       var argv = buf.map { UnsafePointer($0) }
-      return libvlc_new(Int32(argv.count), &argv)
+      return libvlc_new(argumentCount, &argv)
     }
 
     guard let instance else {
@@ -145,7 +224,7 @@ public final class VLCInstance: Sendable {
 
     pointer = instance
     logBroadcaster = LogBroadcaster(instancePointer: instance)
-    libvlc_set_user_agent(instance, "SwiftVLC", "SwiftVLC/1.0")
+    libvlc_set_user_agent(instance, "SwiftVLC", "SwiftVLC")
   }
 
   /// Creates the default shared instance (fatalError on failure).
@@ -158,6 +237,23 @@ public final class VLCInstance: Sendable {
     // otherwise their continuations would hang forever and the C callback
     // could fire after the instance is freed.
     logBroadcaster.invalidate()
+
+    // Defensive: if a DialogHandler outlives normal cleanup or leaks,
+    // strip the libVLC dialog callbacks before release so the C side
+    // doesn't fire into a freed box. The box's Unmanaged retain leaks
+    // in that case (we can't safely release without knowing the type),
+    // but the alternative is a use-after-free.
+    let leakedBox = dialogRegistration.withLock { state -> UnsafeMutableRawPointer? in
+      let box = state.box
+      state.token = nil
+      state.box = nil
+      return box
+    }
+    if leakedBox != nil {
+      libvlc_dialog_set_callbacks(pointer, nil, nil)
+      libvlc_dialog_set_error_callback(pointer, nil, nil)
+    }
+
     libvlc_release(pointer)
   }
 }

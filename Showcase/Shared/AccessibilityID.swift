@@ -14,6 +14,27 @@ enum AccessibilityID {
     }
   }
 
+  enum MusicPlayer {
+    static let playPauseButton = "music.playPause"
+    static let currentTime = "music.currentTime"
+    static let stateLabel = "music.state"
+    static let dismissButton = "music.dismiss"
+
+    static func songButton(_ title: String) -> String {
+      "music.song.\(title)"
+    }
+  }
+
+  enum MacDeinterlace {
+    static let statePicker = "macos.deinterlace.state.picker"
+    static let stateAutoSegment = "macos.deinterlace.state.auto"
+    static let stateOffSegment = "macos.deinterlace.state.off"
+    static let stateOnSegment = "macos.deinterlace.state.on"
+    static let modePicker = "macos.deinterlace.mode.picker"
+    static let stateValue = "macos.deinterlace.state.value"
+    static let modeValue = "macos.deinterlace.mode.value"
+  }
+
   enum SimplePlayback {
     static let videoView = "sp.videoView"
     static let playPauseButton = "sp.playPause"

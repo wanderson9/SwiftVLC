@@ -22,17 +22,18 @@ import Synchronization
 /// }
 /// ```
 public final class DialogHandler: Sendable {
-  private static let registryQueue = DispatchQueue(label: "swiftvlc.dialog-handler.registry")
-  private nonisolated(unsafe) static var activeHandlers: [OpaquePointer: UUID] = [:]
-
   private let instance: VLCInstance
-  private let continuation: AsyncStream<DialogEvent>.Continuation
-  private let registrationToken: UUID
-  private let isRegistered: Bool
-  private nonisolated(unsafe) let boxOpaque: UnsafeMutableRawPointer?
+  private let broadcaster: Broadcaster<DialogEvent>
+  /// Token returned by `VLCInstance.claimDialogRegistration` on
+  /// successful registration. `nil` when this handler lost the race
+  /// to another `DialogHandler` that owns the slot.
+  private let registrationToken: UUID?
 
-  /// Stream of dialog events from VLC.
-  public let dialogs: AsyncStream<DialogEvent>
+  /// Stream of dialog events from VLC. A new independent stream is
+  /// returned per access; subscribers don't compete for events.
+  public var dialogs: AsyncStream<DialogEvent> {
+    broadcaster.subscribe()
+  }
 
   /// Registers dialog callbacks with the given VLC instance.
   ///
@@ -43,75 +44,60 @@ public final class DialogHandler: Sendable {
   public init(instance: VLCInstance = .shared) {
     self.instance = instance
 
-    let (stream, cont) = AsyncStream<DialogEvent>.makeStream(bufferingPolicy: .bufferingNewest(16))
-    dialogs = stream
-    continuation = cont
-    let token = UUID()
-    registrationToken = token
+    let broadcaster = Broadcaster<DialogEvent>(defaultBufferSize: 16)
+    self.broadcaster = broadcaster
 
-    let registration = Self.registryQueue.sync { () -> (registered: Bool, box: UnsafeMutableRawPointer?) in
-      let key = instance.pointer
-      guard Self.activeHandlers[key] == nil else {
-        return (false, nil)
-      }
+    let box = Unmanaged.passRetained(broadcaster).toOpaque()
 
-      let box = Unmanaged.passRetained(DialogContinuationBox(continuation: cont)).toOpaque()
-      var cbs = libvlc_dialog_cbs(
-        pf_display_login: dialogLoginCallback,
-        pf_display_question: dialogQuestionCallback,
-        pf_display_progress: dialogProgressCallback,
-        pf_cancel: dialogCancelCallback,
-        pf_update_progress: dialogUpdateProgressCallback
-      )
-
-      libvlc_dialog_set_callbacks(instance.pointer, &cbs, box)
-      libvlc_dialog_set_error_callback(instance.pointer, dialogErrorCallback, box)
-      Self.activeHandlers[key] = token
-      return (true, box)
-    }
-
-    isRegistered = registration.registered
-    boxOpaque = registration.box
-
-    if !registration.registered {
-      cont.finish()
+    if
+      let token = instance.claimDialogRegistration(
+        box: box,
+        installCallbacks: { pointer, box in
+          var callbacks = libvlc_dialog_cbs(
+            pf_display_login: dialogLoginCallback,
+            pf_display_question: dialogQuestionCallback,
+            pf_display_progress: dialogProgressCallback,
+            pf_cancel: dialogCancelCallback,
+            pf_update_progress: dialogUpdateProgressCallback
+          )
+          libvlc_dialog_set_callbacks(pointer, &callbacks, box)
+          libvlc_dialog_set_error_callback(pointer, dialogErrorCallback, box)
+        }
+      ) {
+      registrationToken = token
+    } else {
+      // Another handler already owns this instance's dialog slot.
+      // Release our box and terminate the broadcaster so any
+      // `dialogs` access on this handler returns an immediately-
+      // finished stream.
+      Unmanaged<Broadcaster<DialogEvent>>.fromOpaque(box).release()
+      registrationToken = nil
+      broadcaster.terminate()
     }
   }
 
   deinit {
-    guard isRegistered else {
-      continuation.finish()
+    guard let token = registrationToken else {
+      broadcaster.terminate()
       return
     }
 
     let instance = self.instance
-    let continuation = self.continuation
-    let token = self.registrationToken
-    nonisolated(unsafe) let box = self.boxOpaque
-    Self.registryQueue.async {
-      let key = instance.pointer
-      if Self.activeHandlers[key] == token {
-        Self.activeHandlers.removeValue(forKey: key)
-        libvlc_dialog_set_callbacks(instance.pointer, nil, nil)
-        libvlc_dialog_set_error_callback(instance.pointer, nil, nil)
-      }
-
-      continuation.finish()
-      if let box {
-        Unmanaged<DialogContinuationBox>.fromOpaque(box).release()
-      }
+    let broadcaster = self.broadcaster
+    // `releaseDialogRegistration` clears the native callbacks while the
+    // instance slot is still locked, so a replacement handler cannot
+    // install callbacks that this teardown then wipes out.
+    if
+      let box = instance.releaseDialogRegistration(
+        token: token,
+        clearCallbacks: { pointer in
+          libvlc_dialog_set_callbacks(pointer, nil, nil)
+          libvlc_dialog_set_error_callback(pointer, nil, nil)
+        }
+      ) {
+      Unmanaged<Broadcaster<DialogEvent>>.fromOpaque(box).release()
     }
-  }
-}
-
-// MARK: - Internal Box
-
-/// Retained by C callbacks via `Unmanaged.passRetained`. Outlives the
-/// `DialogHandler` until explicitly released in deinit.
-private final class DialogContinuationBox: Sendable {
-  let continuation: AsyncStream<DialogEvent>.Continuation
-  init(continuation: AsyncStream<DialogEvent>.Continuation) {
-    self.continuation = continuation
+    broadcaster.terminate()
   }
 }
 
@@ -131,6 +117,45 @@ public enum DialogEvent: Sendable {
   case cancel(DialogID)
   /// VLC encountered an error to display.
   case error(title: String, message: String)
+}
+
+// MARK: - DialogEvent per-case accessors
+
+extension DialogEvent {
+  /// `LoginRequest` if this event is `.login`, otherwise `nil`.
+  public var login: LoginRequest? {
+    if case .login(let value) = self { value } else { nil }
+  }
+
+  /// `QuestionRequest` if this event is `.question`, otherwise `nil`.
+  public var question: QuestionRequest? {
+    if case .question(let value) = self { value } else { nil }
+  }
+
+  /// `ProgressInfo` if this event is `.progress`, otherwise `nil`.
+  public var progress: ProgressInfo? {
+    if case .progress(let value) = self { value } else { nil }
+  }
+
+  /// `ProgressUpdate` if this event is `.progressUpdated`, otherwise `nil`.
+  public var progressUpdated: ProgressUpdate? {
+    if case .progressUpdated(let value) = self { value } else { nil }
+  }
+
+  /// `DialogID` if this event is `.cancel`, otherwise `nil`.
+  public var cancel: DialogID? {
+    if case .cancel(let value) = self { value } else { nil }
+  }
+
+  /// Tuple of `(title: String, message: String)` if this event is
+  /// `.error`, otherwise `nil`.
+  public var error: (title: String, message: String)? {
+    if case .error(let title, let message) = self {
+      (title: title, message: message)
+    } else {
+      nil
+    }
+  }
 }
 
 // MARK: - Dialog ID
@@ -171,8 +196,9 @@ public struct DialogID: Sendable {
 
   @discardableResult
   func postAction(_ action: Int) -> Bool {
-    consume { pointer in
-      libvlc_dialog_post_action(pointer, Int32(action)) == 0
+    guard let action = Int32(exactly: action) else { return false }
+    return consume { pointer in
+      libvlc_dialog_post_action(pointer, action) == 0
     }
   }
 
@@ -319,8 +345,8 @@ private func dialogLoginCallback(
   _ askStore: Bool
 ) {
   guard let data, let dialogId, let title, let text else { return }
-  let box = Unmanaged<DialogContinuationBox>.fromOpaque(data).takeUnretainedValue()
-  box.continuation.yield(.login(LoginRequest(
+  let broadcaster = Unmanaged<Broadcaster<DialogEvent>>.fromOpaque(data).takeUnretainedValue()
+  broadcaster.broadcast(.login(LoginRequest(
     dialogId: DialogID(pointer: dialogId),
     title: String(cString: title),
     text: String(cString: text),
@@ -340,7 +366,7 @@ private func dialogQuestionCallback(
   _ action2: UnsafePointer<CChar>?
 ) {
   guard let data, let dialogId, let title, let text, let cancel else { return }
-  let box = Unmanaged<DialogContinuationBox>.fromOpaque(data).takeUnretainedValue()
+  let broadcaster = Unmanaged<Broadcaster<DialogEvent>>.fromOpaque(data).takeUnretainedValue()
 
   let qType: QuestionType = switch type {
   case LIBVLC_DIALOG_QUESTION_WARNING: .warning
@@ -348,7 +374,7 @@ private func dialogQuestionCallback(
   default: .normal
   }
 
-  box.continuation.yield(.question(QuestionRequest(
+  broadcaster.broadcast(.question(QuestionRequest(
     dialogId: DialogID(pointer: dialogId),
     title: String(cString: title),
     text: String(cString: text),
@@ -369,8 +395,8 @@ private func dialogProgressCallback(
   _ cancel: UnsafePointer<CChar>?
 ) {
   guard let data, let dialogId, let title, let text else { return }
-  let box = Unmanaged<DialogContinuationBox>.fromOpaque(data).takeUnretainedValue()
-  box.continuation.yield(.progress(ProgressInfo(
+  let broadcaster = Unmanaged<Broadcaster<DialogEvent>>.fromOpaque(data).takeUnretainedValue()
+  broadcaster.broadcast(.progress(ProgressInfo(
     dialogId: DialogID(pointer: dialogId),
     title: String(cString: title),
     text: String(cString: text),
@@ -385,9 +411,9 @@ private func dialogCancelCallback(
   _ dialogId: OpaquePointer?
 ) {
   guard let data, let dialogId else { return }
-  let box = Unmanaged<DialogContinuationBox>.fromOpaque(data).takeUnretainedValue()
+  let broadcaster = Unmanaged<Broadcaster<DialogEvent>>.fromOpaque(data).takeUnretainedValue()
   let dialog = DialogID(pointer: dialogId)
-  box.continuation.yield(.cancel(dialog))
+  broadcaster.broadcast(.cancel(dialog))
   _ = dialog.dismiss()
 }
 
@@ -398,8 +424,8 @@ private func dialogUpdateProgressCallback(
   _ text: UnsafePointer<CChar>?
 ) {
   guard let data, let dialogId, let text else { return }
-  let box = Unmanaged<DialogContinuationBox>.fromOpaque(data).takeUnretainedValue()
-  box.continuation.yield(.progressUpdated(ProgressUpdate(
+  let broadcaster = Unmanaged<Broadcaster<DialogEvent>>.fromOpaque(data).takeUnretainedValue()
+  broadcaster.broadcast(.progressUpdated(ProgressUpdate(
     dialogId: DialogID(pointer: dialogId),
     position: position,
     text: String(cString: text)
@@ -412,8 +438,8 @@ private func dialogErrorCallback(
   _ text: UnsafePointer<CChar>?
 ) {
   guard let data, let title, let text else { return }
-  let box = Unmanaged<DialogContinuationBox>.fromOpaque(data).takeUnretainedValue()
-  box.continuation.yield(.error(
+  let broadcaster = Unmanaged<Broadcaster<DialogEvent>>.fromOpaque(data).takeUnretainedValue()
+  broadcaster.broadcast(.error(
     title: String(cString: title),
     message: String(cString: text)
   ))
@@ -437,7 +463,7 @@ private final class DialogIDStorage: @unchecked Sendable {
 
   static func shared(for pointer: OpaquePointer) -> DialogIDStorage {
     registryQueue.sync {
-      if let storage = registry[pointer]?.value {
+      if let storage = registry[pointer]?.value, storage.currentPointer() != nil {
         return storage
       }
 
@@ -460,22 +486,21 @@ private final class DialogIDStorage: @unchecked Sendable {
   }
 
   func consumePointer() -> OpaquePointer? {
-    let pointer = state.withLock { state -> OpaquePointer? in
-      let pointer = state.pointer
-      state.pointer = nil
-      return pointer
-    }
+    Self.registryQueue.sync {
+      let pointer = state.withLock { state -> OpaquePointer? in
+        let pointer = state.pointer
+        state.pointer = nil
+        return pointer
+      }
 
-    if pointer != nil {
-      nonisolated(unsafe) let key = key
-      Self.registryQueue.async {
+      if pointer != nil {
         if Self.registry[key]?.value === self {
           Self.registry.removeValue(forKey: key)
         }
       }
-    }
 
-    return pointer
+      return pointer
+    }
   }
 
   deinit {

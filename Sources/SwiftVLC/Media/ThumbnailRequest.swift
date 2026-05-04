@@ -48,7 +48,9 @@ extension Media {
   ///   - timeout: Maximum time to wait.
   ///   - instance: VLC instance.
   /// - Returns: The raw image data (PNG format).
-  /// - Throws: `VLCError.operationFailed` if thumbnail generation fails.
+  /// - Throws: ``VLCError/invalidInput(_:)`` if `time`, `timeout`, `width`,
+  ///   or `height` is outside libVLC's supported range, or
+  ///   ``VLCError/operationFailed(_:)`` if thumbnail generation fails.
   public func thumbnail(
     at time: Duration,
     width: Int = 320,
@@ -59,6 +61,11 @@ extension Media {
     instance: VLCInstance = .shared
   )
     async throws(VLCError) -> Data {
+    let timeMs = try time.checkedNonnegativeMilliseconds(parameter: "time")
+    let timeoutMs = try timeout.checkedNonnegativeMilliseconds(parameter: "timeout")
+    let width = try checkedUInt32(width, parameter: "width")
+    let height = try checkedUInt32(height, parameter: "height")
+
     try await thumbnailCoordinator.acquire()
     // Structured release: bind the coordinator into a local actor
     // reference so we can release synchronously at the end of this
@@ -133,13 +140,13 @@ extension Media {
           let request = libvlc_media_thumbnail_request_by_time(
             instancePtr,
             media,
-            time.milliseconds,
+            timeMs,
             seekMode.cValue,
-            UInt32(width),
-            UInt32(height),
+            width,
+            height,
             crop,
             libvlc_picture_Png,
-            timeout.milliseconds
+            timeoutMs
           ) else {
           if Task.isCancelled {
             operation.cancel()
@@ -281,6 +288,14 @@ private final class ThumbnailOperationRef: Sendable {
 
 private final class ThumbnailOperation: Sendable {
   private struct State: @unchecked Sendable {
+    // Pointers live inside `State` so the Mutex's release-acquire
+    // pairing establishes a happens-before relation between the init
+    // (writer thread) and the libVLC event-thread callback (reader).
+    // ThreadSanitizer cannot see libVLC's internal synchronization; the
+    // explicit lock here makes the ordering visible without changing
+    // observable behavior — these pointers are write-once at init.
+    let media: OpaquePointer
+    let eventManager: OpaquePointer
     var continuation: CheckedContinuation<Result<Data, VLCError>, Never>?
     var request: OpaquePointer?
     var callbackBox: UnsafeMutableRawPointer?
@@ -296,6 +311,7 @@ private final class ThumbnailOperation: Sendable {
     let request: OpaquePointer?
     let callbackBox: UnsafeMutableRawPointer?
     let shouldDetachEvent: Bool
+    let eventManager: OpaquePointer
   }
 
   private struct Resume: @unchecked Sendable {
@@ -303,22 +319,30 @@ private final class ThumbnailOperation: Sendable {
     let result: Result<Data, VLCError>
   }
 
-  nonisolated(unsafe) let eventManager: OpaquePointer
-  private nonisolated(unsafe) let media: OpaquePointer
   private let state: Mutex<State>
+
+  /// The event manager this operation listens on. Read through the lock
+  /// so callers (including the libVLC callback thread) get a TSan-visible
+  /// happens-before from init.
+  var eventManager: OpaquePointer {
+    state.withLock { $0.eventManager }
+  }
 
   init(
     continuation: CheckedContinuation<Result<Data, VLCError>, Never>,
     media: OpaquePointer,
     eventManager: OpaquePointer
   ) {
-    self.media = media
-    self.eventManager = eventManager
     libvlc_media_retain(media)
-    state = Mutex(State(continuation: continuation))
+    state = Mutex(State(
+      media: media,
+      eventManager: eventManager,
+      continuation: continuation
+    ))
   }
 
   deinit {
+    let media = state.withLock { $0.media }
     libvlc_media_release(media)
   }
 
@@ -429,7 +453,8 @@ private final class ThumbnailOperation: Sendable {
     let cleanup = Cleanup(
       request: state.request,
       callbackBox: state.callbackBox,
-      shouldDetachEvent: state.eventAttached
+      shouldDetachEvent: state.eventAttached,
+      eventManager: state.eventManager
     )
 
     state.request = nil
@@ -443,7 +468,7 @@ private final class ThumbnailOperation: Sendable {
     guard let cleanup else { return }
     if cleanup.shouldDetachEvent, let box = cleanup.callbackBox {
       libvlc_event_detach(
-        eventManager,
+        cleanup.eventManager,
         Int32(libvlc_MediaThumbnailGenerated.rawValue),
         thumbnailCallback,
         box

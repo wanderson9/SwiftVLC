@@ -18,7 +18,13 @@ import Dispatch
 /// ```
 @MainActor
 public final class MediaListPlayer {
-  var pointer: OpaquePointer // libvlc_media_list_player_t*
+  // `var` (not `let`) because `rebuildNativePlayer` swaps the underlying
+  // libVLC handle when the media player or list is detached. Annotated
+  // `nonisolated(unsafe)` to match every other libVLC pointer in the
+  // codebase: reads happen on the @MainActor; the offload-on-deinit
+  // closure binds the swapped pointer through its own
+  // `nonisolated(unsafe) let oldPointer` capture.
+  nonisolated(unsafe) var pointer: OpaquePointer // libvlc_media_list_player_t*
   private var _mediaPlayer: Player?
   private var _mediaList: MediaList?
   private var _playbackMode: PlaybackMode = .default
@@ -129,9 +135,15 @@ public final class MediaListPlayer {
   }
 
   /// Plays the item at the specified index.
-  /// - Throws: `VLCError.operationFailed` if the index is out of range.
+  /// - Throws: ``VLCError/invalidInput(_:)`` if the index is out of range for the
+  ///   attached list, or ``VLCError/operationFailed(_:)`` if libVLC rejects it.
   public func play(at index: Int) throws(VLCError) {
-    guard libvlc_media_list_player_play_item_at_index(pointer, Int32(index)) == 0 else {
+    let count = _mediaList?.count
+    if let count, !(0..<count).contains(index) {
+      throw .invalidInput("index must be in 0..<\(count)")
+    }
+    let index = try checkedNonnegativeInt32(index, parameter: "index")
+    guard libvlc_media_list_player_play_item_at_index(pointer, index) == 0 else {
       throw .operationFailed("Play item at index \(index)")
     }
   }

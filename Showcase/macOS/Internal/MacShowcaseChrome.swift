@@ -90,6 +90,7 @@ struct MacVideoPanel: View {
 struct MacPlaybackControls: View {
   let player: Player
   var showsVolume = true
+  var playPauseAccessibilityID: String?
 
   var body: some View {
     @Bindable var bindable = player
@@ -104,10 +105,18 @@ struct MacPlaybackControls: View {
             systemImage: player.isPlaybackRequestedActive ? "pause.fill" : "play.fill"
           )
         }
+        .optionalAccessibilityIdentifier(playPauseAccessibilityID)
+        .accessibilityLabel(player.isPlaybackRequestedActive ? "Pause" : "Play")
         .keyboardShortcut(.space, modifiers: [])
 
-        Slider(value: $bindable.position, in: 0...1)
-          .disabled(!player.isSeekable)
+        Slider(
+          value: Binding(
+            get: { player.position },
+            set: { try? player.seek(to: PlaybackPosition($0)) }
+          ),
+          in: 0...1
+        )
+        .disabled(!player.isSeekable)
 
         Text(durationLabel(player.currentTime))
           .monospacedDigit()
@@ -119,7 +128,13 @@ struct MacPlaybackControls: View {
         HStack(spacing: 12) {
           Toggle("Muted", isOn: $bindable.isMuted)
             .toggleStyle(.checkbox)
-          Slider(value: $bindable.volume, in: 0...1.25)
+          Slider(
+            value: Binding(
+              get: { player.volume },
+              set: { try? player.setAudioVolume(Volume($0)) }
+            ),
+            in: 0...1.25
+          )
           Text("\(Int(player.volume * 100))%")
             .monospacedDigit()
             .foregroundStyle(.secondary)
@@ -128,6 +143,24 @@ struct MacPlaybackControls: View {
       }
     }
     .controlSize(.regular)
+  }
+}
+
+private struct OptionalAccessibilityIdentifier: ViewModifier {
+  let identifier: String?
+
+  func body(content: Content) -> some View {
+    if let identifier {
+      content.accessibilityIdentifier(identifier)
+    } else {
+      content
+    }
+  }
+}
+
+extension View {
+  fileprivate func optionalAccessibilityIdentifier(_ identifier: String?) -> some View {
+    modifier(OptionalAccessibilityIdentifier(identifier: identifier))
   }
 }
 

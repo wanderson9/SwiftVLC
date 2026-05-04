@@ -1,33 +1,35 @@
 import CLibVLC
+import os
 import Synchronization
 
 /// Bridges libVLC C event callbacks to `AsyncStream<PlayerEvent>`.
 ///
-/// Multi-consumer broadcaster: each call to `makeStream()` returns an
-/// independent `AsyncStream`. The C callback snapshots the registered
-/// continuations under a `Mutex`, then yields outside the lock to avoid
-/// an AB-BA deadlock with Swift's task-cancellation lock.
+/// Multi-consumer fan-out built on `Broadcaster<PlayerEvent>`. Each call
+/// to `makeStream()` returns an independent `AsyncStream`. The C callback
+/// reaches a retained callback context through an `Unmanaged` pointer
+/// passed to libVLC's `event_attach`, then calls `broadcast(_:)` which
+/// snapshots subscribers under a Mutex and yields outside the lock.
 final class EventBridge: Sendable {
   private nonisolated(unsafe) var eventManager: OpaquePointer
-  private let store: ContinuationStore
-  private nonisolated(unsafe) let storeOpaque: UnsafeMutableRawPointer
+  private let context: EventBridgeCallbackContext
+  private nonisolated(unsafe) let contextOpaque: UnsafeMutableRawPointer
   private nonisolated(unsafe) var attachedEventTypes: [Int32]
   private let invalidated = Mutex(false)
 
   init(eventManager: OpaquePointer) {
     self.eventManager = eventManager
 
-    let store = ContinuationStore()
-    self.store = store
-    let opaque = Unmanaged.passRetained(store).toOpaque()
-    storeOpaque = opaque
+    let context = EventBridgeCallbackContext()
+    self.context = context
+    let opaque = Unmanaged.passRetained(context).toOpaque()
+    contextOpaque = opaque
 
     attachedEventTypes = Self.attachEvents(to: eventManager, opaque: opaque)
   }
 
   deinit {
     invalidate()
-    Unmanaged<ContinuationStore>.fromOpaque(storeOpaque).release()
+    Unmanaged<EventBridgeCallbackContext>.fromOpaque(contextOpaque).release()
   }
 
   /// Detaches all event listeners and finishes all streams.
@@ -41,9 +43,9 @@ final class EventBridge: Sendable {
     }
     guard shouldCleanUp else { return }
 
-    Self.detachEvents(attachedEventTypes, from: eventManager, opaque: storeOpaque)
+    Self.detachEvents(attachedEventTypes, from: eventManager, opaque: contextOpaque)
     attachedEventTypes = []
-    store.finishAll()
+    context.finishAll()
   }
 
   /// Moves the existing streams to a replacement native media player.
@@ -52,28 +54,24 @@ final class EventBridge: Sendable {
   /// playback because libVLC keeps a "free vout" whose iOS window provider
   /// still points at the old UIView. The Swift `Player.events` stream must
   /// survive that native-handle swap, so this detaches callbacks from the old
-  /// event manager and attaches the same continuation store to the new one.
+  /// event manager and attaches the same broadcaster to the new one.
   func reattach(to newEventManager: OpaquePointer) {
     let isInvalidated = invalidated.withLock { $0 }
     guard !isInvalidated else { return }
 
-    Self.detachEvents(attachedEventTypes, from: eventManager, opaque: storeOpaque)
+    Self.detachEvents(attachedEventTypes, from: eventManager, opaque: contextOpaque)
     eventManager = newEventManager
-    attachedEventTypes = Self.attachEvents(to: newEventManager, opaque: storeOpaque)
+    attachedEventTypes = Self.attachEvents(to: newEventManager, opaque: contextOpaque)
   }
 
   /// Creates a new independent `AsyncStream` for consuming player events.
   /// Each stream receives all events broadcast after creation.
   func makeStream() -> AsyncStream<PlayerEvent> {
-    let store = store
-    let (stream, continuation) = AsyncStream<PlayerEvent>.makeStream(
-      bufferingPolicy: .bufferingNewest(64)
-    )
-    let id = store.add(continuation: continuation)
-    continuation.onTermination = { _ in
-      store.remove(id: id)
-    }
-    return stream
+    context.makeStream()
+  }
+
+  func makeSourcedStream() -> AsyncStream<SourcedPlayerEvent> {
+    context.makeSourcedStream()
   }
 
   static let playerEventTypes: [Int32] = [
@@ -119,10 +117,9 @@ final class EventBridge: Sendable {
     opaque: UnsafeMutableRawPointer
   ) -> [Int32] {
     var attachedEventTypes: [Int32] = []
-    for eventType in playerEventTypes {
-      if libvlc_event_attach(eventManager, eventType, playerEventCallback, opaque) == 0 {
-        attachedEventTypes.append(eventType)
-      }
+    for eventType in playerEventTypes
+      where libvlc_event_attach(eventManager, eventType, playerEventCallback, opaque) == 0 {
+      attachedEventTypes.append(eventType)
     }
     return attachedEventTypes
   }
@@ -138,103 +135,31 @@ final class EventBridge: Sendable {
   }
 }
 
-// MARK: - Continuation Store
-
-/// Thread-safe storage for multiple `AsyncStream` continuations.
-/// Passed to C callbacks via `Unmanaged`. Id allocation and dictionary
-/// update live under a single `Mutex<State>`, so registration is one
-/// lock acquisition.
-private final class ContinuationStore: Sendable {
-  private struct State {
-    var nextID: Int = 0
-    var continuations: [Int: AsyncStream<PlayerEvent>.Continuation] = [:]
-  }
-
-  private let state = Mutex(State())
-
-  func add(continuation: AsyncStream<PlayerEvent>.Continuation) -> Int {
-    state.withLock { state in
-      let id = state.nextID
-      state.nextID += 1
-      state.continuations[id] = continuation
-      return id
-    }
-  }
-
-  func remove(id: Int) {
-    state.withLock { _ = $0.continuations.removeValue(forKey: id) }
-  }
-
-  func broadcast(_ event: PlayerEvent) {
-    // Copy continuations under the lock, then yield outside it.
-    // yield() may resume a consumer task, acquiring its status record
-    // lock. If we held the Mutex during yield, a concurrent task
-    // cancellation (which holds the status lock and calls onTermination
-    // → remove → acquire Mutex) would deadlock (AB-BA).
-    let snapshot = state.withLock { Array($0.continuations.values) }
-    for cont in snapshot {
-      cont.yield(event)
-    }
-  }
-
-  func finishAll() {
-    let snapshot = state.withLock { state -> [AsyncStream<PlayerEvent>.Continuation] in
-      let values = Array(state.continuations.values)
-      state.continuations.removeAll()
-      return values
-    }
-    for cont in snapshot {
-      cont.finish()
-    }
-  }
+struct SourcedPlayerEvent {
+  let source: UInt
+  let event: PlayerEvent
 }
 
-// MARK: - Async Broadcaster
+private final class EventBridgeCallbackContext: Sendable {
+  private let events = Broadcaster<PlayerEvent>(defaultBufferSize: 64)
+  private let sourcedEvents = Broadcaster<SourcedPlayerEvent>(defaultBufferSize: 64)
 
-/// Small multi-consumer broadcaster for player-owned state that is not
-/// emitted by libVLC. It mirrors `ContinuationStore`'s lock discipline:
-/// copy continuations while locked, then yield outside the lock.
-final class AsyncBroadcaster<Element: Sendable>: Sendable {
-  private struct State {
-    var nextID: Int = 0
-    var continuations: [Int: AsyncStream<Element>.Continuation] = [:]
+  func makeStream() -> AsyncStream<PlayerEvent> {
+    events.subscribe()
   }
 
-  private let state = Mutex(State())
-
-  func makeStream(bufferingNewest count: Int = 16) -> AsyncStream<Element> {
-    let store = self
-    let (stream, continuation) = AsyncStream<Element>.makeStream(
-      bufferingPolicy: .bufferingNewest(count)
-    )
-    let id = state.withLock { state in
-      let id = state.nextID
-      state.nextID += 1
-      state.continuations[id] = continuation
-      return id
-    }
-    continuation.onTermination = { _ in
-      store.state.withLock { _ = $0.continuations.removeValue(forKey: id) }
-    }
-    return stream
+  func makeSourcedStream() -> AsyncStream<SourcedPlayerEvent> {
+    sourcedEvents.subscribe()
   }
 
-  func broadcast(_ value: Element) {
-    let snapshot = state.withLock { Array($0.continuations.values) }
-    for continuation in snapshot {
-      continuation.yield(value)
-    }
+  func broadcast(_ event: PlayerEvent, source: UInt) {
+    events.broadcast(event)
+    sourcedEvents.broadcast(SourcedPlayerEvent(source: source, event: event))
   }
 
   func finishAll() {
-    let snapshot = state.withLock { state -> [AsyncStream<Element>.Continuation] in
-      let values = Array(state.continuations.values)
-      state.continuations.removeAll()
-      return values
-    }
-    for continuation in snapshot {
-      continuation.finish()
-    }
+    events.finishAll()
+    sourcedEvents.finishAll()
   }
 }
 
@@ -248,11 +173,18 @@ private func playerEventCallback(
 ) {
   guard let event, let opaque else { return }
 
-  let store = Unmanaged<ContinuationStore>.fromOpaque(opaque).takeUnretainedValue()
+  let interval = Signposts.signposter.beginInterval("EventBridge.callback")
+  defer { Signposts.signposter.endInterval("EventBridge.callback", interval) }
+
+  let context = Unmanaged<EventBridgeCallbackContext>.fromOpaque(opaque).takeUnretainedValue()
 
   if let mapped = mapEvent(event.pointee) {
-    store.broadcast(mapped)
+    context.broadcast(mapped, source: sourceIdentifier(for: event.pointee))
   }
+}
+
+func sourceIdentifier(for event: libvlc_event_t) -> UInt {
+  event.p_obj.map { UInt(bitPattern: $0) } ?? 0
 }
 
 /// Maps a single libVLC `libvlc_event_t` to a typed `PlayerEvent`.

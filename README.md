@@ -5,6 +5,7 @@
 </picture>
 
 [![Tests](https://github.com/harflabs/SwiftVLC/actions/workflows/test.yml/badge.svg)](https://github.com/harflabs/SwiftVLC/actions/workflows/test.yml)
+[![codecov](https://codecov.io/gh/harflabs/SwiftVLC/branch/main/graph/badge.svg)](https://codecov.io/gh/harflabs/SwiftVLC)
 [![Swift versions](https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Fharflabs%2FSwiftVLC%2Fbadge%3Ftype%3Dswift-versions)](https://swiftpackageindex.com/harflabs/SwiftVLC)
 [![Platforms](https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Fharflabs%2FSwiftVLC%2Fbadge%3Ftype%3Dplatforms)](https://swiftpackageindex.com/harflabs/SwiftVLC)
 
@@ -32,7 +33,7 @@ The existing iOS wrapper, [VLCKit](https://code.videolan.org/videolan/VLCKit), i
 | **Errors** | `throws(VLCError)`, typed and exhaustive | `NSError` codes |
 | **Events** | `AsyncStream<PlayerEvent>` with multiple consumers | `NSNotificationCenter` |
 | **libVLC version** | 4.0 | 3.x |
-| **PiP** | Built in via the vmem pipeline | Not included |
+| **PiP** | iOS via public AVKit sample buffers; macOS private backend is SPI opt-in | Not included |
 | **Swift 6 safe** | Yes, with strict concurrency | No |
 
 ## Features
@@ -43,7 +44,7 @@ The existing iOS wrapper, [VLCKit](https://code.videolan.org/videolan/VLCKit), i
 - Asynchronous media parsing: `try await media.parse()` with cancellation support.
 - 10-band equalizer with libVLC's built-in presets.
 - A-B looping, playback rate control, and subtitle and audio delay.
-- Picture-in-Picture with full playback controls.
+- Picture-in-Picture on iOS with full playback controls; macOS native PiP is available only through an explicit private-API SPI opt-in.
 - Network discovery for LAN, SMB, UPnP media sources, and Chromecast and AirPlay renderers.
 - 360° video with full viewpoint control over yaw, pitch, roll, and field of view.
 - Asynchronous thumbnail generation at arbitrary timestamps.
@@ -106,9 +107,9 @@ let player = Player()
 try player.play(url: videoURL)
 player.pause()
 player.stop()
-player.position = 0.5  // Seek to 50%
-player.rate = 1.5       // 1.5x speed
-player.volume = 0.8     // 80% volume
+try player.seek(to: PlaybackPosition(0.5)) // Seek to 50%
+try player.setPlaybackRate(1.5)            // 1.5x speed
+try player.setAudioVolume(0.8)             // 80% volume
 player.isMuted = true
 
 // Tracks
@@ -143,15 +144,16 @@ The `Showcase/` directory contains separate folders, targets, and schemes for ea
 - **tvOS.** Native tvOS showcase app target with TV-focused focus navigation and Siri Remote controls.
 - **visionOS.** Native visionOS app target with a focused simple playback showcase.
 
-Showcase UI tests live under `Showcase/UITests/`: the existing coverage lives in the `iOSUITests` target, while `macOSUITests` and `tvOSUITests` are empty target shells. The visionOS showcase does not have a UI-test target yet.
+Showcase UI tests live under `Showcase/UITests/`. `iOSUITests` covers the broad showcase flows, and `macOSUITests` now covers the release-critical PiP, deinterlacing, and music-player regressions. `tvOSUITests` is still an empty target shell, and the visionOS showcase does not have a UI-test target yet.
 
 ## Testing
 
-A comprehensive [Swift Testing](https://developer.apple.com/xcode/swift-testing/)
-suite covers every public API. There is no XCTest and no mocks: every
-test runs against the real libVLC binary, so regressions in the C
-bridge surface immediately rather than hiding behind a fake. CI runs
-the full suite on every push and every pull request.
+The core package uses a comprehensive
+[Swift Testing](https://developer.apple.com/xcode/swift-testing/) suite
+against the real libVLC binary, so regressions in the C bridge surface
+immediately rather than hiding behind a fake. Showcase UI tests use
+XCTest separately. CI runs the full suite on every push and every pull
+request.
 
 ```bash
 swift test
@@ -169,7 +171,7 @@ cd SwiftVLC
 swift test
 ```
 
-`main` tracks the latest released `url + checksum` form of the libVLC binary target, and the Showcase app tracks that same Swift package release. `setup-dev.sh` downloads `libvlc.xcframework.zip` into `Vendor/` and flips your checkout back to repo-local sources so package development and the Showcase app both build against what is on disk.
+`main` tracks the latest released `url + checksum` form of the libVLC binary target. `setup-dev.sh` downloads `libvlc.xcframework.zip` into `Vendor/` and idempotently flips `Package.swift` plus the Showcase package reference to repo-local sources so package development and Showcase builds use the checkout on disk.
 
 | `setup-dev.sh` flag | Effect |
 |---|---|

@@ -1,3 +1,10 @@
+// swiftlint:disable file_length
+//
+// MemoryPressureTests is a deliberately long, flat list of churn
+// scenarios for memory and lifecycle stress. Each scenario is a few
+// dozen lines of setup + assertion; splitting by domain area would
+// scatter related stress patterns across files for no benefit.
+
 @testable import SwiftVLC
 import Foundation
 import Synchronization
@@ -356,11 +363,11 @@ extension Integration {
           let eq = Equalizer()
           probes.add(eq)
           player.equalizer = eq
-          eq.preamp = Float.random(in: -5...5)
+          eq.preampGain = EqualizerGain(Float.random(in: -5...5))
           var bands = eq.bands
           if !bands.isEmpty {
             bands[0] = Float.random(in: -10...10)
-            eq.bands = bands
+            try? eq.setBands(bands)
           }
           player.equalizer = nil
         }
@@ -547,13 +554,13 @@ extension Integration {
     /// Minimal PiPController lifecycle: single create, single drop, no
     /// playback, no observations triggered. Regression guard for the
     /// `AVPictureInPictureController.ContentSource` → `playbackDelegate`
-    /// retention cycle. The content source retains the delegate
+    /// retention cycle: the content source retains its `playbackDelegate`
     /// strongly at runtime despite the header declaring the property
-    /// `weak`; before the fix, passing `self` as the playback delegate
-    /// created `PiPController → pipController → contentSource →
-    /// playbackDelegate (self)` and prevented deinit. The fix is an
-    /// internal delegate proxy with a weak back-reference; this test
-    /// catches any regression that reverts to the cycle.
+    /// `weak`, so conforming `PiPController` directly would form
+    /// `PiPController → pipController → contentSource → playbackDelegate
+    /// (self)` and prevent deinit. The internal proxy with a weak
+    /// back-reference avoids the cycle; this test fails if anything
+    /// reintroduces it.
     @Test
     func `PiPController deallocates after a single create-and-drop`() async {
       weak var weakController: PiPController?
@@ -592,16 +599,14 @@ extension Integration {
     }
 
     /// Drop the controller mid-playback, then drive the player through
-    /// many observable changes. Regression guard for the earlier
-    /// `stateObserverTask` pattern that used `withCheckedContinuation`
-    /// + `withObservationTracking` with a `guard let self` hoisted
-    /// above the await. The strong binding was captured into the
-    /// suspended task frame and pinned `self` until an observed
-    /// property changed — which wouldn't happen while the controller
-    /// was leaked. The fix rewires the observer to `for await _ in
-    /// player.events` with `guard let self` scoped inside the loop
-    /// body; this test confirms the binding doesn't persist across the
-    /// implicit next-event suspension.
+    /// many observable changes. Regression guard for `stateObserverTask`
+    /// retaining `self` across suspension: hoisting `guard let self`
+    /// above an `await` would capture the strong binding into the
+    /// suspended task frame and pin `self` until an observed property
+    /// changed — which wouldn't happen while the controller was leaked.
+    /// The observer scopes `guard let self` *inside* a `for await _ in
+    /// player.events` loop body so the binding doesn't persist across
+    /// the implicit next-event suspension; this test confirms.
     @Test(.enabled(if: TestCondition.canPlayMedia))
     func `PiPController deallocates even while player is churning observable state`() async throws {
       let player = Player(instance: TestInstance.makeAudioOnly())
@@ -616,7 +621,7 @@ extension Integration {
 
       try player.play(url: TestMedia.twosecURL)
       for i in 0..<50 {
-        player.volume = Float(i % 100) / 100
+        try? player.setAudioVolume(Volume(Float(i % 100) / 100))
         if i % 5 == 0 {
           player.pause()
           player.resume()
@@ -1072,3 +1077,5 @@ private final class WeakPiPControllerProbes {
   }
 }
 #endif
+
+// swiftlint:enable file_length
