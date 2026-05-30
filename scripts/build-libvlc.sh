@@ -862,7 +862,7 @@ replacement = (
     '\n'
     '# SWIFTVLC_XROS_TARGET_TRIPLE: the pinned VLC build script leaves xrOS\n'
     '# min-version flags empty, which makes clang stamp objects with the SDK\n'
-    '# version. Use a target triple so visionOS objects keep SwiftVLC's minimum.\n'
+    '# version. Use a target triple so visionOS objects keep SwiftVLC\'s minimum.\n'
     'if [ "$VLC_HOST_OS" = "xros" ]; then\n'
     '    xros_simulator_suffix=""\n'
     '    if [ -n "$VLC_HOST_PLATFORM_SIMULATOR" ]; then\n'
