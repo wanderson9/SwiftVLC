@@ -1077,6 +1077,69 @@ PYEOF
 
 patch_vlc_disable_rust
 
+# --- Step 1h: Disable GPL-positive contribs ---
+# Remove libzvbi (GPL-2.0+), libgcrypt (dual LGPL/GPL), libgpg-error (dual
+# LGPL/GPL) so the produced static archive is pure LGPL-2.1+ plus permissive.
+# --disable-zvbi removes the VBI/teletext plugin and its inline helper.
+# --disable-gnutls removes GnuTLS, which pulls in libgcrypt + libgpg-error.
+patch_vlc_disable_gpl_contribs() {
+    local BUILD_SH="${VLC_SRC}/extras/package/apple/build.sh"
+
+    if grep -q 'SWIFTVLC_DISABLE_GPL_CONTRIBS' "$BUILD_SH"; then
+        info "VLC GPL contribs already disabled"
+        return 0
+    fi
+
+    info "Disabling GPL-positive contribs: zvbi, gnutls (gcrypt/gpg-error)..."
+
+    python3 - "$BUILD_SH" << 'PYEOF'
+import sys
+
+build_sh_path = sys.argv[1]
+
+with open(build_sh_path, 'r') as f:
+    content = f.read()
+
+# Insert after the --disable-debug block.  The Catalyst patch already
+# inserts its own block before this same anchor, so we look for our
+# earlier --catalyst insert + --disable-debug together.
+needle = (
+    'if [ "$VLC_DISABLE_DEBUG" -gt "0" ]; then\n'
+    '            VLC_CONFIG_OPTIONS+=( "--disable-debug" )\n'
+    '        fi'
+)
+
+replacement = (
+    'if [ "$VLC_DISABLE_DEBUG" -gt "0" ]; then\n'
+    '            VLC_CONFIG_OPTIONS+=( "--disable-debug" )\n'
+    '        fi\n'
+    '\n'
+    '        # SWIFTVLC_DISABLE_GPL_CONTRIBS: Remove GPL-positive libraries.\n'
+    '        # --disable-zvbi       libzvbi (GPL-2.0+, teletext/VBI decoder)\n'
+    '        # --disable-gnutls     GnuTLS, pulls libgcrypt + libgpg-error\n'
+    '        VLC_CONFIG_OPTIONS+=( "--disable-zvbi" )\n'
+    '        VLC_CONFIG_OPTIONS+=( "--disable-gnutls" )'
+)
+
+if needle not in content:
+    raise SystemExit(
+        'VLC_CONFIG_OPTIONS --disable-debug block not found '
+        '— VLC build.sh shape changed'
+    )
+
+content = content.replace(needle, replacement, 1)
+
+with open(build_sh_path, 'w') as f:
+    f.write(content)
+
+print('GPL contribs disabled successfully')
+PYEOF
+
+    info "VLC GPL contribs disabled"
+}
+
+patch_vlc_disable_gpl_contribs
+
 # --- Step 2: Build tools ---
 info "Building VLC build tools..."
 export PATH="${VLC_SRC}/extras/tools/build/bin:$PATH"
