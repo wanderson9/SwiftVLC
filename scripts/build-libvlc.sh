@@ -1100,25 +1100,24 @@ build_sh_path = sys.argv[1]
 with open(build_sh_path, 'r') as f:
     content = f.read()
 
-# Insert after the --disable-debug block.  The Catalyst patch already
-# inserts its own block before this same anchor, so we look for our
-# earlier --catalyst insert + --disable-debug together.
+# Insert after the --disable-debug block (after Catalyst patches have
+# already been applied, so we match the final indentation).
 needle = (
     'if [ "$VLC_DISABLE_DEBUG" -gt "0" ]; then\n'
-    '            VLC_CONFIG_OPTIONS+=( "--disable-debug" )\n'
-    '        fi'
+    '    VLC_CONFIG_OPTIONS+=( "--disable-debug" )\n'
+    'fi'
 )
 
 replacement = (
     'if [ "$VLC_DISABLE_DEBUG" -gt "0" ]; then\n'
-    '            VLC_CONFIG_OPTIONS+=( "--disable-debug" )\n'
-    '        fi\n'
+    '    VLC_CONFIG_OPTIONS+=( "--disable-debug" )\n'
+    'fi\n'
     '\n'
-    '        # SWIFTVLC_DISABLE_GPL_CONTRIBS: Remove GPL-positive libraries.\n'
-    '        # --disable-zvbi       libzvbi (GPL-2.0+, teletext/VBI decoder)\n'
-    '        # --disable-gnutls     GnuTLS, pulls libgcrypt + libgpg-error\n'
-    '        VLC_CONFIG_OPTIONS+=( "--disable-zvbi" )\n'
-    '        VLC_CONFIG_OPTIONS+=( "--disable-gnutls" )'
+    '# SWIFTVLC_DISABLE_GPL_CONTRIBS: Remove GPL-positive libraries.\n'
+    '# --disable-zvbi       libzvbi (GPL-2.0+, teletext/VBI decoder)\n'
+    '# --disable-gnutls     GnuTLS, pulls libgcrypt + libgpg-error\n'
+    'VLC_CONFIG_OPTIONS+=( "--disable-zvbi" )\n'
+    'VLC_CONFIG_OPTIONS+=( "--disable-gnutls" )'
 )
 
 if needle not in content:
