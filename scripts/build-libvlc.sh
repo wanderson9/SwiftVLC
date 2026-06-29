@@ -1090,7 +1090,7 @@ patch_vlc_disable_gpl_contribs() {
         return 0
     fi
 
-    info "Disabling GPL-positive contribs: zvbi, gnutls (gcrypt/gpg-error)..."
+    info "Disabling GPL-positive contribs: zvbi, gnutls (gcrypt/gpg-error); also disabling aom (nasm 3.x compat)..."
 
     python3 - "$BUILD_SH" << 'PYEOF'
 import sys
@@ -1113,11 +1113,14 @@ replacement = (
     '    VLC_CONFIG_OPTIONS+=( "--disable-debug" )\n'
     'fi\n'
     '\n'
-    '# SWIFTVLC_DISABLE_GPL_CONTRIBS: Remove GPL-positive libraries.\n'
+    '# SWIFTVLC_DISABLE_GPL_CONTRIBS: Remove GPL-positive libraries;\n'
+    '# also disable libaom to avoid nasm 3.x multipass-opt failure.\n'
     '# --disable-zvbi       libzvbi (GPL-2.0+, teletext/VBI decoder)\n'
     '# --disable-gnutls     GnuTLS, pulls libgcrypt + libgpg-error\n'
+    '# --disable-aom        AV1 encoder (dav1d handles decoding)\n'
     'VLC_CONFIG_OPTIONS+=( "--disable-zvbi" )\n'
-    'VLC_CONFIG_OPTIONS+=( "--disable-gnutls" )'
+    'VLC_CONFIG_OPTIONS+=( "--disable-gnutls" )\n'
+    'VLC_CONFIG_OPTIONS+=( "--disable-aom" )'
 )
 
 if needle not in content:
